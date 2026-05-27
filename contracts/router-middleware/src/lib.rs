@@ -302,7 +302,12 @@ impl RouterMiddleware {
                         state.calls_in_window
                     };
                     let window_start = if window_elapsed {
-                        now
+                        // Ensure window_start never moves backward
+                        if now >= state.window_start {
+                            now
+                        } else {
+                            state.window_start
+                        }
                     } else {
                         state.window_start
                     };
@@ -1490,5 +1495,37 @@ mod tests {
         assert_eq!(topic, Symbol::new(&env, "middleware_enabled"));
         let emitted: bool = last.2.into_val(&env);
         assert!(!emitted);
+    }
+
+    // ── Issue #442: window_start must not move backward ───────────────────────
+
+    #[test]
+    fn test_window_start_never_moves_backward() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &5, &60, &true, &0, &0, &0);
+
+        let caller = Address::generate(&env);
+
+        // Make a call at t=100 to record window_start
+        env.ledger().set_timestamp(100);
+        client.pre_call(&caller, &route);
+        let state = client.rate_limit_state(&route, &caller).unwrap();
+        let original_window_start = state.window_start;
+
+        // Advance time past the window
+        env.ledger().set_timestamp(200);
+        client.pre_call(&caller, &route);
+
+        let state_after = client.rate_limit_state(&route, &caller).unwrap();
+        // New window_start must be >= original window_start
+        assert!(
+            state_after.window_start >= original_window_start,
+            "window_start moved backward: {} < {}",
+            state_after.window_start,
+            original_window_start
+        );
+        // And it should equal the current timestamp (200)
+        assert_eq!(state_after.window_start, 200);
     }
 }
