@@ -51,6 +51,8 @@ use alloc::string::ToString;
 //!
 //! ## Events
 //! - `fee_estimated` — emitted on each `estimate_fee` call (total_fee, surge_pricing)
+//! ## Events (following naming convention: past tense verbs in snake_case)
+//! - `quote_requested` — Quote request logged (route_name, token_in, token_out, amount_in)
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
