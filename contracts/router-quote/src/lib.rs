@@ -63,6 +63,7 @@ use soroban_sdk::{
 #[contracttype]
 pub enum DataKey {
     QuoteTtl, // TTL for quotes in ledger seconds
+    HopCache(Address, Address, Address, i128), // (plugin, token_in, token_out, amount_in) -> HopCacheEntry
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -90,6 +91,13 @@ pub struct HopResult {
     pub amount_in: i128,
     pub amount_out: i128,
     pub fee_amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HopCacheEntry {
+    pub amount_out: i128,
+    pub expires_at: u64,
 }
 
 /// Response for a single-hop or multi-hop quote.
@@ -237,10 +245,12 @@ pub enum QuoteError {
     InvalidSlippage = 5,
     EmptyRoute = 6,
     RouteTooLong = 7,
+    TokenMismatch = 8,
 }
 
 // Maximum hops allowed in a multi-hop route. Keeps gas costs bounded.
 const MAX_HOPS: u32 = 5;
+const HOP_CACHE_TTL_SECS: u64 = 5;
 
 }
 
@@ -404,6 +414,18 @@ impl RouterQuote {
             return Err(QuoteError::InvalidSlippage);
         }
 
+        // Validate token continuity: hop[N].token_out must equal hop[N+1].token_in
+        let hop_count = hops.len();
+        let mut i = 0u32;
+        while i + 1 < hop_count {
+            let current = hops.get(i).unwrap();
+            let next = hops.get(i + 1).unwrap();
+            if current.token_out != next.token_in {
+                return Err(QuoteError::TokenMismatch);
+            }
+            i += 1;
+        }
+
         Self::execute_hops(&env, hops, amount_in, slippage_bps, precision)
         // Call the plugin's get_quote function
         let function = Symbol::new(&env, "get_quote");
@@ -565,7 +587,13 @@ impl RouterQuote {
         let mut hop_results = Vec::new(env);
 
         for hop in hops.iter() {
-            let gross_amount_out = Self::call_plugin(env, &hop.plugin, &hop.token_in, &hop.token_out, current_amount)?;
+            let gross_amount_out = Self::get_cached_hop_quote(
+                env,
+                &hop.plugin,
+                &hop.token_in,
+                &hop.token_out,
+                current_amount,
+            )?;
 
             // Fee is taken from the input of each hop
             let fee_amount = current_amount * hop.fee_bps as i128 / 10_000;
@@ -628,6 +656,41 @@ impl RouterQuote {
             .map_err(|_| QuoteError::QuoteFailed)?
             .map_err(|_| QuoteError::QuoteFailed)
     }
+
+    /// Returns a hop quote, using a short-lived per-hop cache when available.
+    fn get_cached_hop_quote(
+        env: &Env,
+        plugin: &Address,
+        token_in: &Address,
+        token_out: &Address,
+        amount_in: i128,
+    ) -> Result<i128, QuoteError> {
+        let key = DataKey::HopCache(
+            plugin.clone(),
+            token_in.clone(),
+            token_out.clone(),
+            amount_in,
+        );
+        let now = env.ledger().timestamp();
+
+        if let Some(cached) = env.storage().instance().get::<DataKey, HopCacheEntry>(&key) {
+            if now < cached.expires_at {
+                return Ok(cached.amount_out);
+            }
+            env.storage().instance().remove(&key);
+        }
+
+        let amount_out = Self::call_plugin(env, plugin, token_in, token_out, amount_in)?;
+        env.storage().instance().set(
+            &key,
+            &HopCacheEntry {
+                amount_out,
+                expires_at: now + HOP_CACHE_TTL_SECS,
+            },
+        );
+
+        Ok(amount_out)
+    }
     /// Get multiple quotes in a single call (for comparing routes).
     ///
     /// # Arguments
@@ -642,11 +705,10 @@ impl RouterQuote {
         env: Env,
         router_core: Option<Address>,
         requests: Vec<QuoteRequest>,
-    ) -> Vec<QuoteResponse> {
+    ) -> Vec<Result<QuoteResponse, QuoteError>> {
         let mut responses = Vec::new(&env);
-        
         for req in requests.iter() {
-            let response = Self::get_quote(
+            let result = Self::get_quote(
                 env.clone(),
                 router_core.clone(),
                 req.route_name.clone(),
@@ -655,25 +717,8 @@ impl RouterQuote {
                 req.amount_in,
                 req.slippage_bps,
             );
-            
-            match response {
-                Ok(quote) => responses.push_back(quote),
-                Err(_) => {
-                    // On failure, add a zero quote (caller can check amount_out == 0)
-                    responses.push_back(QuoteResponse {
-                        amount_out: 0,
-                        fee_amount: 0,
-                        route_name: req.route_name.clone(),
-                        target: req.route_name.clone().try_into().unwrap_or(Address::from_contract_id(&env, &[0u8; 32])),
-                        min_amount_out: 0,
-                        exchange_rate: String::from_str(&env, "0"),
-                        price_impact_bps: 0,
-                        expires_at: env.ledger().timestamp(),
-                    });
-                }
-            }
+            responses.push_back(result);
         }
-        
         responses
     }
 
@@ -965,6 +1010,21 @@ mod tests {
     }
 
     #[test]
+    fn test_multihop_token_mismatch_fails() {
+        let (env, client, double, triple) = setup();
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let tc = Address::generate(&env);
+        let td = Address::generate(&env); // unrelated token — breaks chain
+
+        // Hop 1: A → B, Hop 2: C → D (B != C → TokenMismatch)
+        let mut hops = soroban_sdk::Vec::new(&env);
+        hops.push_back(HopDescriptor { plugin: double, token_in: ta, token_out: tb, fee_bps: 0 });
+        hops.push_back(HopDescriptor { plugin: triple, token_in: tc, token_out: td, fee_bps: 0 });
+
+        let r = client.try_get_multihop_quote(&hops, &1000, &0, &6);
+        assert_eq!(r, Err(Ok(QuoteError::TokenMismatch)));
+    }    #[test]
     fn test_multihop_too_many_hops_fails() {
         let (env, client, double, _) = setup();
         let ta = Address::generate(&env);
