@@ -369,7 +369,6 @@ impl RouterRegistry {
         }
 
         let constraint_str = constraint.unwrap();
-        let mut matched_constraint = false;
 
         if versions.is_empty() {
             return Err(RegistryError::NotFound);
@@ -389,13 +388,10 @@ impl RouterRegistry {
                 .get(&DataKey::Entry(name.clone(), v))
                 .ok_or(RegistryError::NotFound)?;
             if Self::version_matches_constraint(v, &constraint_str)? {
-                matched_constraint = true;
-            } else {
-                continue;
-            }
-
-            if !entry.deprecated {
-                return Ok(entry);
+                any_constraint_match = true;
+                if !entry.deprecated {
+                    return Ok(entry);
+                }
             }
         }
         if any_constraint_match {
@@ -506,7 +502,13 @@ impl RouterRegistry {
         entries: Vec<(String, u32)>,
     ) -> Result<Vec<Result<(), RegistryError>>, RegistryError> {
         caller.require_auth();
-        router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, RegistryError)?;
+        if Self::require_admin(&env, &caller).is_err() {
+            let mut results = Vec::new(&env);
+            for _ in entries.iter() {
+                results.push_back(Err(RegistryError::Unauthorized));
+            }
+            return results;
+        }
         let mut results = Vec::new(&env);
         for (name, version) in entries.iter() {
             results.push_back(Self::deprecate_one(&env, name, version, None));
@@ -664,14 +666,23 @@ impl RouterRegistry {
         let (name, version): (String, u32) = env
             .storage()
             .instance()
-            .get(&DataKey::AddressIndex(address))?;
-        let (name, version) = env
-            .storage()
-            .instance()
-            .get::<DataKey, (String, u32)>(&DataKey::AddressIndex(address))?;
-        env.storage()
-            .instance()
-            .get(&DataKey::Entry(name, version))
+            .get(&DataKey::ContractNames)
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        for name in names.iter() {
+            let versions = Self::get_versions_list(&env, &name);
+            for v in versions.iter() {
+                if let Some(entry) = env.storage()
+                    .instance()
+                    .get::<DataKey, ContractEntry>(&DataKey::Entry(name.clone(), v))
+                {
+                    if entry.address == address {
+                        return Some(entry);
+                    }
+                }
+            }
+        }
+        None
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1219,12 +1230,10 @@ mod tests {
         client.register(&admin, &name, &a1, &1);
         client.register(&admin, &name, &a2, &2);
         client.register(&admin, &name, &a3, &3);
-        client.deprecate(&admin, &name, &1, &None);
-        client.deprecate(&admin, &name, &2, &None);
-        client.deprecate(&admin, &name, &3, &None);
-        client.deprecate(&admin, &name, &1, &None::<String>);
-        client.deprecate(&admin, &name, &2, &None::<String>);
-        client.deprecate(&admin, &name, &3, &None::<String>);
+        client.deprecate(&admin, &name, &1);
+        client.deprecate(&admin, &name, &2);
+        client.deprecate(&admin, &name, &3);
+
         let constraint = String::from_str(&env, ">=1");
         let result = client.try_get_latest_with_constraint(&name, &Some(constraint));
         assert_eq!(result, Err(Ok(RegistryError::AllVersionsDeprecated)));

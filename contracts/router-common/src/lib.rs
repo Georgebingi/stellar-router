@@ -1,9 +1,12 @@
+#![no_std]
+
 //! # router-common
 //!
 //! Shared macros and utilities for the stellar-router suite.
 //!
 //! ## Macros
 //! - [`require_admin!`] — inline admin check used across router contracts
+//! - [`require_admin_simple!`] — convenience version with standard error variants
 //! - [`require_admin_simple!`] — convenience macro for standard DataKey::Admin and error variants
 //! - [`admin_transfer_complete!`] — shared admin transfer pattern (storage set + event emit)
 //!
@@ -159,6 +162,23 @@ macro_rules! require_admin {
     }};
 }
 
+/// Convenience version when using DataKey::Admin and standard error variants.
+///
+/// This eliminates the repetitive `require_admin` / `require_super_admin` boilerplate
+/// across all router contracts while allowing each contract to use its own error enum.
+#[macro_export]
+macro_rules! require_admin_simple {
+    ($env:expr, $caller:expr, $data_key:expr, $error_type:ty) => {
+        $crate::require_admin!(
+            $env,
+            $caller,
+            $data_key,
+            <$error_type>::NotInitialized,
+            <$error_type>::Unauthorized
+        )
+    };
+}
+
 /// Returns `true` if `s` is empty or consists entirely of ASCII whitespace
 /// (space 0x20, tab 0x09, newline 0x0A, vertical tab 0x0B, form feed 0x0C,
 /// carriage return 0x0D).
@@ -220,20 +240,6 @@ mod tests {
     fn test_name_with_surrounding_spaces_is_not_whitespace_only() {
         assert!(!is_whitespace_only(" oracle "));
     }
-}
-
-/// Convenience version when using DataKey::Admin and standard error variants
-#[macro_export]
-macro_rules! require_admin_simple {
-    ($env:expr, $caller:expr, $data_key:expr, $error_type:ty) => {
-        $crate::require_admin!(
-            $env,
-            $caller,
-            $data_key,
-            <$error_type>::NotInitialized,
-            <$error_type>::Unauthorized
-        )
-    };
 }
 
 /// Helper macro for completing the admin transfer after validation.
