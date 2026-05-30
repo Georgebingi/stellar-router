@@ -198,7 +198,7 @@ impl RouterMiddleware {
         log_retention: u32,
     ) -> Result<(), MiddlewareError> {
         caller.require_auth();
-        Self::require_admin(&env, &caller)?;
+        router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, MiddlewareError)?;
 
         if window_seconds == 0 && max_calls_per_window > 0 {
             return Err(MiddlewareError::InvalidConfig);
@@ -577,7 +577,7 @@ impl RouterMiddleware {
         enabled: bool,
     ) -> Result<(), MiddlewareError> {
         caller.require_auth();
-        Self::require_admin(&env, &caller)?;
+        router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, MiddlewareError)?;
         env.storage()
             .instance()
             .set(&DataKey::GlobalEnabled, &enabled);
@@ -634,6 +634,57 @@ impl RouterMiddleware {
                 ordered.push_back(entry);
             }
         }
+        ordered
+    }
+
+    /// Get a filtered call log for a route.
+    ///
+    /// Returns only successful or only failed call log entries for `route`,
+    /// reducing data transfer for monitoring use cases compared to `get_call_log`.
+    /// Entries are returned in chronological order (oldest first).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `route` - The route name to retrieve logs for.
+    /// * `success_only` - If `true`, returns only successful entries; if `false`, returns only failed entries.
+    ///
+    /// # Returns
+    /// A [`Vec<CallLogEntry>`] containing only entries matching the filter.
+    pub fn get_call_log_filtered(env: Env, route: String, success_only: bool) -> Vec<CallLogEntry> {
+        let Some(log_state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, CallLogState>(&DataKey::CallLog(route))
+        else {
+            return Vec::new(&env);
+        };
+
+        if log_state.entries.is_empty() {
+            return Vec::new(&env);
+        }
+
+        let len = log_state.entries.len();
+        let mut ordered = Vec::new(&env);
+
+        if log_state.head == 0 {
+            for i in 0..len {
+                if let Some(entry) = log_state.entries.get(i) {
+                    if entry.success == success_only {
+                        ordered.push_back(entry);
+                    }
+                }
+            }
+        } else {
+            for i in 0..len {
+                let idx = (log_state.head + i) % len;
+                if let Some(entry) = log_state.entries.get(idx) {
+                    if entry.success == success_only {
+                        ordered.push_back(entry);
+                    }
+                }
+            }
+        }
+
         ordered
     }
 
@@ -699,7 +750,7 @@ impl RouterMiddleware {
         route: String,
     ) -> Result<(), MiddlewareError> {
         caller.require_auth();
-        Self::require_admin(&env, &caller)?;
+        router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, MiddlewareError)?;
         env.storage().instance().remove(&DataKey::CallLog(route.clone()));
         env.events().publish(
             (Symbol::new(&env, "call_log_cleared"),),
@@ -811,14 +862,15 @@ impl RouterMiddleware {
     /// # Panics
     /// * Panics if the contract has not been initialized.
     /// 
-    /// Note: This is a breaking change from the previous Result-based API.
-    /// Calling admin() on an uninitialized contract is considered a programming error
-    /// rather than a runtime condition, consistent with how similar getters work.
-    pub fn admin(env: Env) -> Address {
+    /// Get the current admin address.
+    ///
+    /// # Errors
+    /// Returns `MiddlewareError::NotInitialized` if the contract has not been initialized.
+    pub fn admin(env: Env) -> Result<Address, MiddlewareError> {
         env.storage()
             .instance()
             .get(&DataKey::Admin)
-            .expect("not initialized")
+            .ok_or(MiddlewareError::NotInitialized)
     }
 
     /// Reset circuit breaker for a route.
@@ -843,7 +895,7 @@ impl RouterMiddleware {
         route: String,
     ) -> Result<(), MiddlewareError> {
         caller.require_auth();
-        Self::require_admin(&env, &caller)?;
+        router_common::require_admin_simple!(&env, &caller, &DataKey::Admin, MiddlewareError)?;
 
         let reset_state = CircuitBreakerState {
             failure_count: 0,
@@ -891,20 +943,11 @@ impl RouterMiddleware {
         new_admin: Address,
     ) -> Result<(), MiddlewareError> {
         current.require_auth();
-        Self::require_admin(&env, &current)?;
+        router_common::require_admin_simple!(&env, &current, &DataKey::Admin, MiddlewareError)?;
         router_common::admin_transfer_complete!(&env, &current, &new_admin, &DataKey::Admin);
         Ok(())
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    fn require_admin(env: &Env, caller: &Address) -> Result<(), MiddlewareError> {
-        let admin = Self::admin(env.clone());
-        if &admin != caller {
-            return Err(MiddlewareError::Unauthorized);
-        }
-        Ok(())
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1599,6 +1642,87 @@ mod tests {
         assert_eq!(topic, Symbol::new(&env, "middleware_enabled"));
         let emitted: bool = last.2.into_val(&env);
         assert!(!emitted);
+    }
+
+    // ── Issue #491: get_call_log_filtered ────────────────────────────────────
+
+    #[test]
+    fn test_get_call_log_filtered_empty_when_no_calls() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &10);
+
+        assert!(client.get_call_log_filtered(&route, &true).is_empty());
+        assert!(client.get_call_log_filtered(&route, &false).is_empty());
+    }
+
+    #[test]
+    fn test_get_call_log_filtered_success_only() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &10);
+
+        client.post_call(&caller, &route, &true);
+        client.post_call(&caller, &route, &false);
+        client.post_call(&caller, &route, &true);
+
+        let filtered = client.get_call_log_filtered(&route, &true);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.get(0).unwrap().success);
+        assert!(filtered.get(1).unwrap().success);
+    }
+
+    #[test]
+    fn test_get_call_log_filtered_failure_only() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &10);
+
+        client.post_call(&caller, &route, &true);
+        client.post_call(&caller, &route, &false);
+        client.post_call(&caller, &route, &false);
+
+        let filtered = client.get_call_log_filtered(&route, &false);
+        assert_eq!(filtered.len(), 2);
+        assert!(!filtered.get(0).unwrap().success);
+        assert!(!filtered.get(1).unwrap().success);
+    }
+
+    #[test]
+    fn test_get_call_log_filtered_all_success_no_failures() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &5);
+
+        client.post_call(&caller, &route, &true);
+        client.post_call(&caller, &route, &true);
+
+        assert!(client.get_call_log_filtered(&route, &false).is_empty());
+        assert_eq!(client.get_call_log_filtered(&route, &true).len(), 2);
+    }
+
+    #[test]
+    fn test_get_call_log_filtered_with_ring_buffer_wraparound() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let caller = Address::generate(&env);
+        // retention=3, make 5 calls so ring buffer wraps
+        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &3);
+
+        client.post_call(&caller, &route, &true);  // evicted
+        client.post_call(&caller, &route, &false); // evicted
+        client.post_call(&caller, &route, &true);  // retained
+        client.post_call(&caller, &route, &false); // retained
+        client.post_call(&caller, &route, &true);  // retained
+
+        // 3 retained: success, failure, success
+        let success = client.get_call_log_filtered(&route, &true);
+        let failure = client.get_call_log_filtered(&route, &false);
+        assert_eq!(success.len(), 2);
+        assert_eq!(failure.len(), 1);
     }
 
     // ── Issue #449: get_call_log_summary ─────────────────────────────────────

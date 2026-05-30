@@ -176,7 +176,7 @@ impl RouterAccess {
             .set(&DataKey::HasRole(role.clone(), target.clone()), &true);
 
         env.events().publish(
-            (Symbol::new(&env, "role_granted"),),
+            (Symbol::new(&env, router_common::EVENT_ROLE_GRANTED),),
             (role, target),
             .set(&DataKey::AddressRoles(account.clone()), &roles);
 
@@ -185,7 +185,7 @@ impl RouterAccess {
         env.storage().instance().set(&key, &expiry_timestamp);
 
         env.events().publish(
-            (Symbol::new(&env, "role_granted"),),
+            (Symbol::new(&env, router_common::EVENT_ROLE_GRANTED),),
             (account, role, expiry_timestamp),
         );
         Ok(())
@@ -226,7 +226,7 @@ impl RouterAccess {
             .remove(&DataKey::RoleMemberIndex(role.clone(), target.clone()));
 
         env.events().publish(
-            (Symbol::new(&env, "role_revoked"),),
+            (Symbol::new(&env, router_common::EVENT_ROLE_REVOKED),),
             (role, target),
         );
         Ok(())
@@ -273,7 +273,7 @@ impl RouterAccess {
             .set(&DataKey::RoleParent(role.clone()), &parent_role);
 
         env.events().publish(
-            (Symbol::new(&env, "role_parent_set"),),
+            (Symbol::new(&env, router_common::EVENT_ROLE_PARENT_SET),),
             (role, parent_role),
         );
         Ok(())
@@ -295,7 +295,7 @@ impl RouterAccess {
         Self::require_super_admin(&env, &caller)?;
         env.storage().instance().remove(&DataKey::RoleParent(role.clone()));
         env.events().publish(
-            (Symbol::new(&env, "role_parent_removed"),),
+            (Symbol::new(&env, router_common::EVENT_ROLE_PARENT_REMOVED),),
             role,
         );
         Ok(())
@@ -449,7 +449,7 @@ impl RouterAccess {
         }
 
         env.events().publish(
-            (Symbol::new(&env, "address_blacklisted"),),
+            (Symbol::new(&env, router_common::EVENT_ADDRESS_BLACKLISTED),),
             (target, reason, expires_at),
         );
 
@@ -565,7 +565,7 @@ impl RouterAccess {
             .instance()
             .set(&DataKey::SuperAdmin, &new_admin);
         env.events().publish(
-            (Symbol::new(&env, "admin_transferred"),),
+            (Symbol::new(&env, router_common::EVENT_ADMIN_TRANSFERRED),),
             (current, new_admin),
         );
         Ok(())
@@ -625,6 +625,27 @@ impl RouterAccess {
             results.push_back(Self::grant_role_internal(&env, &account, &role, expires_in));
         }
         Ok(results)
+    }
+
+    /// Revoke a role from multiple accounts in one call.
+    ///
+    /// Calls [`Self::revoke_role`] for each target and returns `Ok(())` only
+    /// if all revocations succeed.
+    ///
+    /// # Errors
+    /// * [`AccessError::Unauthorized`] — caller is not super-admin or role admin.
+    /// * [`AccessError::RoleNotFound`] — a target does not hold the role directly.
+    pub fn bulk_revoke_role(
+        env: Env,
+        caller: Address,
+        role: String,
+        targets: Vec<Address>,
+    ) -> Result<(), AccessError> {
+        caller.require_auth();
+        for target in targets.iter() {
+            Self::revoke_role(env.clone(), caller.clone(), role.clone(), target.clone())?;
+        }
+        Ok(())
     }
 
     /// Revoke a role from multiple accounts in one call.
@@ -1129,6 +1150,54 @@ mod tests {
 
         client.unblacklist(&admin, &user);
         assert!(client.has_role(&user, &role));
+    }
+
+    // ── Issue #443: blacklist expires_at ──────────────────────────────────────
+
+    #[test]
+    fn test_blacklist_expires_after_timestamp() {
+        let (env, admin, client) = setup();
+        let user = Address::generate(&env);
+
+        // Blacklist with expiry 100 seconds from now (ledger timestamp starts at 0)
+        client.blacklist(&admin, &user, &None::<String>, &Some(100u64));
+        assert!(client.is_blacklisted(&user));
+
+        // Advance time past expiry
+        env.ledger().set_timestamp(101);
+        // Expired blacklist should be treated as not blacklisted
+        assert!(!client.is_blacklisted(&user));
+    }
+
+    #[test]
+    fn test_blacklist_without_expiry_is_permanent() {
+        let (env, admin, client) = setup();
+        let user = Address::generate(&env);
+
+        client.blacklist(&admin, &user, &None::<String>, &None);
+        assert!(client.is_blacklisted(&user));
+
+        // Advance time significantly — should still be blacklisted
+        env.ledger().set_timestamp(999_999);
+        assert!(client.is_blacklisted(&user));
+    }
+
+    #[test]
+    fn test_expired_blacklist_allows_role_grant() {
+        let (env, admin, client) = setup();
+        let role = String::from_str(&env, "operator");
+        let user = Address::generate(&env);
+
+        // Blacklist with short expiry
+        client.blacklist(&admin, &user, &None::<String>, &Some(50u64));
+        assert!(client.is_blacklisted(&user));
+
+        // Advance past expiry
+        env.ledger().set_timestamp(51);
+        assert!(!client.is_blacklisted(&user));
+
+        // Should now be able to grant role
+        assert!(client.try_grant_role(&admin, &user, &role, &None).is_ok());
     }
 
     #[test]
