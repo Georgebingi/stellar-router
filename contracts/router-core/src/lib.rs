@@ -28,6 +28,8 @@
 //! - `best_route_selected` — Best route selected (route_name)
 //! - `admin_transferred` — Admin transferred (old_admin, new_admin)
 
+pub mod scoring;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
@@ -381,7 +383,7 @@ impl RouterCore {
         env.storage().instance().set(&DataKey::Aliases, &updated_aliases);
 
         // Removing a route may invalidate the cached best route; refresh it.
-        Self::recompute_best_route(&env);
+        scoring::recompute_best_route(&env);
 
         env.events()
             .publish((Symbol::new(&env, "route_removed"),), name.clone());
@@ -531,7 +533,7 @@ impl RouterCore {
 
         Ok(result)
         // Removing routes may invalidate the cached best route; refresh it once.
-        Self::recompute_best_route(&env);
+        scoring::recompute_best_route(&env);
 
         Ok(())
     }
@@ -667,7 +669,7 @@ impl RouterCore {
             .publish((Symbol::new(&env, "route_paused"),), (name.clone(), paused));
 
         // Pause state affects best-route eligibility; refresh the cache.
-        Self::recompute_best_route(&env);
+        scoring::recompute_best_route(&env);
 
         Ok(())
     }
@@ -1078,7 +1080,7 @@ impl RouterCore {
         );
 
         // Scoring can change which route is best; refresh the cache.
-        Self::recompute_best_route(&env);
+        scoring::recompute_best_route(&env);
 
         Ok(())
     }
@@ -1218,63 +1220,8 @@ impl RouterCore {
             .unwrap_or(Vec::new(env))
     }
 
-    /// Recompute and cache the highest-scoring, non-paused route.
-    ///
-    /// Performs a single O(n) scan over all routes and stores the winner under
-    /// [`DataKey::BestRoute`] (or removes the key when no scored, non-paused
-    /// route exists). This is called only from write paths that can change the
-    /// outcome — scoring, pausing, and route removal — so that the hot
-    /// [`resolve`] path can read the result in O(1).
-    fn recompute_best_route(env: &Env) {
-        let names = Self::get_route_names(env);
-        let mut best_name: Option<String> = None;
-        let mut best_score: i64 = i64::MIN;
 
-        for name in names.iter() {
-            // Skip missing or paused routes
-            match env
-                .storage()
-                .instance()
-                .get::<DataKey, RouteEntry>(&DataKey::Route(name.clone()))
-            {
-                Some(e) if !e.paused => {}
-                _ => continue,
-            }
-
-            // Skip routes without a score
-            let score: RouteScore = match env
-                .storage()
-                .instance()
-                .get(&DataKey::Score(name.clone()))
-            {
-                Some(s) => s,
-                None => continue,
-            };
-
-            // Composite score: liquidity + reliability - fee_bps/10
-            let composite: i64 = score.liquidity_score as i64
-                + score.reliability_score as i64
-                - (score.fee_bps as i64 / 10);
-
-            if composite > best_score {
-                best_score = composite;
-                best_name = Some(name.clone());
-            }
-        }
-
-        match best_name {
-            Some(name) => {
-                env.storage().instance().set(&DataKey::BestRoute, &name);
-                env.events().publish(
-                    (Symbol::new(env, "best_route_selected"),),
-                    (name, best_score),
-                );
-            }
-            None => env.storage().instance().remove(&DataKey::BestRoute),
-        }
-    }
-
-    /// Returns `true` if `name` is empty or consists entirely of ASCII whitespace
+        /// Returns `true` if `name` is empty or consists entirely of ASCII whitespace
     /// characters (space 0x20, tab 0x09, newline 0x0A, vertical tab 0x0B,
     /// form feed 0x0C, carriage return 0x0D).
     fn is_empty_or_whitespace(name: &String) -> bool {
