@@ -30,6 +30,8 @@
 //! - `best_route_selected` — Best route selected (route_name)
 //! - `admin_transferred` — Admin transferred (old_admin, new_admin)
 
+pub mod scoring;
+
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
 };
@@ -390,7 +392,7 @@ impl RouterCore {
             .set(&DataKey::Aliases, &updated_aliases);
 
         // Removing a route may invalidate the cached best route; refresh it.
-        Self::recompute_best_route(&env);
+        scoring::recompute_best_route(&env);
 
         env.events()
             .publish((Symbol::new(&env, router_common::EVENT_ROUTE_REMOVED),), name.clone());
@@ -539,7 +541,7 @@ impl RouterCore {
         }
 
         // Removing routes may invalidate the cached best route; refresh it once.
-        Self::recompute_best_route(&env);
+        scoring::recompute_best_route(&env);
 
         Ok(result)
     }
@@ -675,7 +677,7 @@ impl RouterCore {
             .publish((Symbol::new(&env, router_common::EVENT_ROUTE_PAUSED),), (name.clone(), paused));
 
         // Pause state affects best-route eligibility; refresh the cache.
-        Self::recompute_best_route(&env);
+        scoring::recompute_best_route(&env);
 
         Ok(())
     }
@@ -1225,7 +1227,7 @@ impl RouterCore {
         );
 
         // Scoring can change which route is best; refresh the cache.
-        Self::recompute_best_route(&env);
+        scoring::recompute_best_route(&env);
 
         Ok(())
     }
@@ -1416,7 +1418,7 @@ impl RouterCore {
         }
     }
 
-    /// Returns `true` if `name` is empty or consists entirely of ASCII whitespace
+        /// Returns `true` if `name` is empty or consists entirely of ASCII whitespace
     /// characters (space 0x20, tab 0x09, newline 0x0A, vertical tab 0x0B,
     /// form feed 0x0C, carriage return 0x0D).
     fn is_empty_or_whitespace(name: &String) -> bool {
