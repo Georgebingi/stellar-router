@@ -364,31 +364,7 @@ impl RouterCore {
             .set(&DataKey::RouteCount, &count.saturating_sub(1));
 
         // Clean up any aliases pointing to this route
-        let aliases = Self::get_aliases(&env);
-        let mut updated_aliases = Vec::new(&env);
-        for alias in aliases.iter() {
-            if let Some(original_name) = env
-                .storage()
-                .instance()
-                .get::<DataKey, String>(&DataKey::Alias(alias.clone()))
-            {
-                if original_name == name {
-                    // Remove this dangling alias
-                    env.storage()
-                        .instance()
-                        .remove(&DataKey::Alias(alias.clone()));
-                } else {
-                    // Keep this alias
-                    updated_aliases.push_back(alias);
-                }
-            } else {
-                // Alias doesn't exist in storage, remove from list
-                // (this shouldn't happen but cleans up inconsistencies)
-            }
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::Aliases, &updated_aliases);
+        Self::remove_aliases_for_route(&env, &name);
 
         // Removing a route may invalidate the cached best route; refresh it.
         Self::recompute_best_route(&env);
@@ -1005,16 +981,7 @@ impl RouterCore {
         // Use shared validation helper for alias name
         Self::validate_route_name(&env, &alias_name)?;
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Alias(alias_name.clone()), &existing_name);
-
-        // Track alias name for cleanup
-        let mut aliases = Self::get_aliases(&env);
-        if !aliases.contains(&alias_name) {
-            aliases.push_back(alias_name.clone());
-            env.storage().instance().set(&DataKey::Aliases, &aliases);
-        }
+        Self::add_alias_internal(&env, &alias_name, &existing_name)?;
 
         env.events().publish(
             (Symbol::new(&env, "alias_added"),),
@@ -1365,6 +1332,38 @@ impl RouterCore {
             .unwrap_or(Vec::new(env))
     }
 
+    fn remove_aliases_for_route(env: &Env, route_name: &String) {
+        let aliases = Self::get_aliases(env);
+        let mut updated_aliases = Vec::new(env);
+
+        for alias in aliases.iter() {
+            let alias_key = DataKey::Alias(alias.clone());
+            match env.storage().instance().get::<DataKey, String>(&alias_key) {
+                Some(original_name) if original_name == route_name.clone() => {
+                    env.storage().instance().remove(&alias_key);
+                }
+                Some(_) => updated_aliases.push_back(alias),
+                None => {}
+            }
+        }
+
+        env.storage().instance().set(&DataKey::Aliases, &updated_aliases);
+    }
+
+    fn add_alias_internal(env: &Env, alias: &String, target: &String) -> Result<(), RouterError> {
+        Self::validate_route_name(env, alias)?;
+
+        env.storage().instance().set(&DataKey::Alias(alias.clone()), target);
+
+        let mut aliases = Self::get_aliases(env);
+        if !aliases.contains(alias) {
+            aliases.push_back(alias.clone());
+            env.storage().instance().set(&DataKey::Aliases, &aliases);
+        }
+
+        Ok(())
+    }
+
     /// Recompute and cache the highest-scoring, non-paused route.
     ///
     /// Performs a single O(n) scan over all routes and stores the winner under
@@ -1565,26 +1564,7 @@ impl RouterCore {
             .instance()
             .set(&DataKey::RouteCount, &count.saturating_sub(1));
 
-        let aliases = Self::get_aliases(env);
-        let mut updated_aliases = Vec::new(env);
-        for alias in aliases.iter() {
-            if let Some(original_name) = env
-                .storage()
-                .instance()
-                .get::<DataKey, String>(&DataKey::Alias(alias.clone()))
-            {
-                if original_name != name {
-                    updated_aliases.push_back(alias);
-                } else {
-                    env.storage()
-                        .instance()
-                        .remove(&DataKey::Alias(alias.clone()));
-                }
-            }
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::Aliases, &updated_aliases);
+        Self::remove_aliases_for_route(env, &name);
 
         env.events()
             .publish((Symbol::new(env, router_common::EVENT_ROUTE_REMOVED),), name);
