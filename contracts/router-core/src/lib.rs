@@ -35,6 +35,7 @@ use soroban_sdk::{
 };
 extern crate alloc;
 use alloc::string::ToString;
+use router_common::is_whitespace_only;
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -1416,17 +1417,6 @@ impl RouterCore {
         }
     }
 
-    /// Returns `true` if `name` is empty or consists entirely of ASCII whitespace
-    /// characters (space 0x20, tab 0x09, newline 0x0A, vertical tab 0x0B,
-    /// form feed 0x0C, carriage return 0x0D).
-    fn is_empty_or_whitespace(name: &String) -> bool {
-        if name.len() == 0 {
-            return true;
-        }
-        let s = name.to_string();
-        s.bytes().all(|b| matches!(b, 9 | 10 | 11 | 12 | 13 | 32))
-    }
-
     /// Validates a route name for use in register_route and add_alias.
     ///
     /// Valid names are 1–64 characters, containing only ASCII alphanumeric
@@ -1443,17 +1433,17 @@ impl RouterCore {
     /// * [`RouterError::InvalidRouteName`] — if the name is empty, whitespace-only, longer than 64 chars, or contains disallowed characters.
     /// * [`RouterError::RouteAlreadyExists`] — if the name conflicts with an existing route or alias.
     fn validate_route_name(env: &Env, name: &String) -> Result<(), RouterError> {
-        if Self::is_empty_or_whitespace(name) {
+        let s = name.to_string();
+        if is_whitespace_only(&s) {
             return Err(RouterError::InvalidRouteName);
         }
 
         // Max 64 characters
-        if name.len() > 64 {
+        if s.len() > 64 {
             return Err(RouterError::InvalidRouteName);
         }
 
         // Only alphanumeric, '-', and '/' are allowed
-        let s = name.to_string();
         for b in s.bytes() {
             if !matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'/') {
                 return Err(RouterError::InvalidRouteName);
