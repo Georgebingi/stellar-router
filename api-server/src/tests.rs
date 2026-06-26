@@ -11,7 +11,7 @@ use crate::{
     handlers,
     state::AppState,
     types::{
-        ErrorCode, RouteDetails, SimulateRequest, SimulateResponse, TransactionStatus,
+        RouteDetails, SimulateRequest, SimulateResponse, TransactionStatus,
         TransactionStatusEvent,
     },
 };
