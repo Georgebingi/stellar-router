@@ -148,8 +148,8 @@ pub enum RouterError {
     InvalidMetadata = 9,
     CircularDependency = 10,
     RouteInUse = 11,
-    InvalidAddress = 10,
-    RouteExpired = 10,
+    InvalidAddress = 12,
+    RouteExpired = 13,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -1190,7 +1190,15 @@ impl RouterCore {
                 .get::<DataKey, RouteMetadata>(&DataKey::Metadata(name))
             {
                 for tag in metadata.tags.iter() {
-                    if !tags.contains(&tag) {
+                    // Sort and deduplicate by checking if already added
+                    let mut found = false;
+                    for existing_tag in tags.iter() {
+                        if existing_tag == tag {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
                         tags.push_back(tag);
                     }
                 }
@@ -1670,6 +1678,9 @@ impl RouterCore {
             aliases.push_back(alias.clone());
             env.storage().instance().set(&DataKey::Aliases, &aliases);
         }
+        Ok(())
+    }
+
     fn resolve_dependencies_recursive(
         env: &Env,
         name: &String,
@@ -4097,6 +4108,65 @@ mod tests {
         assert!(tags.contains(&dex));
         assert!(tags.contains(&stable));
         assert!(tags.contains(&beta));
+    }
+
+    // ── Issue #632: get_all_tags O(n²) deduplication ────────────────────────
+
+    #[test]
+    fn test_get_all_tags_deduplicates_efficiently() {
+        let (env, admin, client) = setup();
+        let addr = Address::generate(&env);
+        let common = String::from_str(&env, "common-tag");
+        let unique1 = String::from_str(&env, "unique1");
+        let unique2 = String::from_str(&env, "unique2");
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let r3 = String::from_str(&env, "route-c");
+
+        // All routes share "common-tag" but have unique tags too
+        client.register_route(
+            &admin,
+            &r1,
+            &addr,
+            &Some(RouteMetadata {
+                description: String::from_str(&env, "Route A"),
+                tags: vec![&env, common.clone(), unique1.clone()],
+                owner: admin.clone(),
+            }),
+        );
+        client.register_route(
+            &admin,
+            &r2,
+            &addr,
+            &Some(RouteMetadata {
+                description: String::from_str(&env, "Route B"),
+                tags: vec![&env, common.clone()],
+                owner: admin.clone(),
+            }),
+        );
+        client.register_route(
+            &admin,
+            &r3,
+            &addr,
+            &Some(RouteMetadata {
+                description: String::from_str(&env, "Route C"),
+                tags: vec![&env, common.clone(), unique2.clone()],
+                owner: admin.clone(),
+            }),
+        );
+
+        let tags = client.get_all_tags();
+        // Should have: common (shared), unique1, unique2
+        assert_eq!(tags.len(), 3);
+        
+        // Count occurrences of "common" — should be exactly 1
+        let mut common_count = 0;
+        for tag in tags.iter() {
+            if tag == common {
+                common_count += 1;
+            }
+        }
+        assert_eq!(common_count, 1, "common_tag should appear exactly once");
     }
 
     #[test]
