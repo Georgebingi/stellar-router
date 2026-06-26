@@ -171,6 +171,7 @@ impl RouterQuote {
     /// Get fee in basis points for a specific route.
     ///
     /// Returns the route-specific fee if set, otherwise returns the default fee.
+    /// Returns `QuoteError::NotInitialized` if the contract has not been initialized.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -178,16 +179,18 @@ impl RouterQuote {
     ///
     /// # Returns
     /// Fee in basis points.
-    pub fn get_route_fee(env: Env, route: String) -> u32 {
-        env.storage()
+    ///
+    /// # Errors
+    /// * [`QuoteError::NotInitialized`] — if the contract has not been initialized.
+    pub fn get_route_fee(env: Env, route: String) -> Result<u32, QuoteError> {
+        match env
+            .storage()
             .instance()
             .get::<DataKey, u32>(&DataKey::RouteFee(route))
-            .unwrap_or_else(|| {
-                env.storage()
-                    .instance()
-                    .get(&DataKey::DefaultFee)
-                    .unwrap_or(100) // Default to 1% if not initialized
-            })
+        {
+            Some(fee) => Ok(fee),
+            None => Self::get_default_fee(env),
+        }
     }
 
     /// Get all configured router fee.
@@ -204,8 +207,9 @@ impl RouterQuote {
         let mut configures_routes = Vec::new(&env);
 
         for route in routes {
-            let fee = Self::get_route_fee(env.clone(), route.clone());
-            configures_routes.push_back((route, fee));
+            if let Ok(fee) = Self::get_route_fee(env.clone(), route.clone()) {
+                configures_routes.push_back((route, fee));
+            }
         }
         configures_routes
     }
@@ -230,7 +234,7 @@ impl RouterQuote {
             return Err(QuoteError::InvalidAmount);
         }
 
-        let fee_bps = Self::get_route_fee(env.clone(), request.route.clone());
+        let fee_bps = Self::get_route_fee(env.clone(), request.route.clone())?;
 
         // Calculate fee: fee_amount = amount_in * fee_bps / 10000
         let fee_amount = request
@@ -409,16 +413,24 @@ impl RouterQuote {
 
     /// Get the current default fee in basis points.
     ///
+    /// Returns `QuoteError::NotInitialized` if the contract has not been
+    /// initialized (i.e., `initialize()` was never called and no `DefaultFee`
+    /// key exists in storage). This prevents silent fee computation with an
+    /// unintended fallback value.
+    ///
     /// # Arguments
     /// * `env` - The Soroban environment.
     ///
     /// # Returns
     /// Default fee in basis points.
-    pub fn get_default_fee(env: Env) -> u32 {
+    ///
+    /// # Errors
+    /// * [`QuoteError::NotInitialized`] — if the contract has not been initialized.
+    pub fn get_default_fee(env: Env) -> Result<u32, QuoteError> {
         env.storage()
             .instance()
             .get(&DataKey::DefaultFee)
-            .unwrap_or(100) // Default to 1% if not initialized
+            .ok_or(QuoteError::NotInitialized)
     }
 
     /// Get current admin address.
@@ -534,6 +546,54 @@ mod tests {
         let admin = Address::generate(&env);
         let result = client.try_initialize(&admin, &10001);
         assert_eq!(result, Err(Ok(QuoteError::InvalidFeeBps)));
+    }
+
+    /// Issue #629: get_default_fee must return NotInitialized when the contract
+    /// has not been initialized, rather than silently returning 100 bps.
+    #[test]
+    fn test_get_default_fee_returns_not_initialized_when_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RouterQuote);
+        let client = RouterQuoteClient::new(&env, &contract_id);
+        // initialize() was NOT called
+        let result = client.try_get_default_fee();
+        assert_eq!(result, Err(Ok(QuoteError::NotInitialized)));
+    }
+
+    /// Issue #629: get_route_fee must return NotInitialized when the contract
+    /// has not been initialized (no DefaultFee key in storage).
+    #[test]
+    fn test_get_route_fee_returns_not_initialized_when_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RouterQuote);
+        let client = RouterQuoteClient::new(&env, &contract_id);
+        // initialize() was NOT called
+        let route = String::from_str(&env, "uniswap");
+        let result = client.try_get_route_fee(&route);
+        assert_eq!(result, Err(Ok(QuoteError::NotInitialized)));
+    }
+
+    /// Issue #629: get_quote must propagate NotInitialized rather than computing
+    /// a quote with an unintended 1% fallback fee.
+    #[test]
+    fn test_get_quote_returns_not_initialized_when_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, RouterQuote);
+        let client = RouterQuoteClient::new(&env, &contract_id);
+        // initialize() was NOT called
+        let token_in = Address::generate(&env);
+        let token_out = Address::generate(&env);
+        let request = QuoteRequest {
+            route: String::from_str(&env, "uniswap"),
+            token_in,
+            token_out,
+            amount_in: 10000,
+        };
+        let result = client.try_get_quote(&request);
+        assert_eq!(result, Err(Ok(QuoteError::NotInitialized)));
     }
 
     #[test]
