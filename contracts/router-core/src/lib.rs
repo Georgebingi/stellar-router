@@ -1641,8 +1641,6 @@ mod tests {
         assert!(!has_metadata);
     }
 
-    // ── RouteMetadata validation tests (issues #180 & #191) ──────────────────
-
     #[test]
     fn test_set_route_paused_updates_updated_by() {
         let (env, admin, client) = setup();
