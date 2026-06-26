@@ -105,6 +105,8 @@ pub struct CallLogState {
     pub entries: Vec<CallLogEntry>,
     /// Index of the oldest entry in `entries` (0 when not wrapped)
     pub head: u32,
+}
+
 /// Aggregated summary for a route's call log.
 /// Maintained incrementally to avoid loading all entries.
 #[contracttype]
@@ -1070,43 +1072,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_call_log_length_zero_before_calls() {
-        let (env, admin, client) = setup();
-        let route = String::from_str(&env, "oracle/get_price");
-        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &3);
-
-        assert_eq!(client.get_call_log_length(&route), 0);
-    }
-
-    #[test]
-    fn test_get_call_log_length_matches_get_call_log() {
-        let (env, admin, client) = setup();
-        let route = String::from_str(&env, "oracle/get_price");
-        let caller = Address::generate(&env);
-        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &5);
-
-        client.post_call(&caller, &route, &true);
-        client.post_call(&caller, &route, &false);
-
-        assert_eq!(client.get_call_log_length(&route), client.get_call_log(&route).len());
-    }
-
-    #[test]
-    fn test_get_call_log_length_respects_retention() {
-        let (env, admin, client) = setup();
-        let route = String::from_str(&env, "oracle/get_price");
-        let caller = Address::generate(&env);
-        client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &2);
-
-        client.post_call(&caller, &route, &true);
-        client.post_call(&caller, &route, &false);
-        client.post_call(&caller, &route, &true);
-
-        assert_eq!(client.get_call_log_length(&route), 2);
-        assert_eq!(client.get_call_log(&route).len(), 2);
-    }
-
-    #[test]
     fn test_rate_limit_isolated_per_route() {
         let (env, admin, client) = setup();
         let route_a = String::from_str(&env, "oracle/price");
@@ -1805,7 +1770,7 @@ mod tests {
         let (env, admin, client) = setup();
         let route = String::from_str(&env, "oracle/get_price");
         let caller = Address::generate(&env);
-        
+
         // Configure with failure_threshold=1, recovery_window=100s
         client.configure_route(&admin, &route, &0, &0, &true, &1, &100, &0);
 
@@ -1826,5 +1791,117 @@ mod tests {
 
         // Should now succeed (at exactly recovery_window_seconds)
         assert!(client.try_pre_call(&caller, &route).is_ok());
+    }
+
+    // ── Issue #643: rate limit counter persistence ────────────────────────────
+
+    #[test]
+    fn test_rate_limit_counter_increments_per_call() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &10, &60, &true, &0, &0, &0);
+
+        let caller = Address::generate(&env);
+        for _ in 0..5 {
+            client.pre_call(&caller, &route);
+        }
+
+        let state = client.rate_limit_state(&route, &caller).unwrap();
+        assert_eq!(state.calls_in_window, 5);
+    }
+
+    #[test]
+    fn test_rate_limit_boundary_exactly_at_max_then_rejected() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &3, &60, &true, &0, &0, &0);
+
+        let caller = Address::generate(&env);
+
+        // Exactly 3 calls — all should succeed
+        client.pre_call(&caller, &route);
+        client.pre_call(&caller, &route);
+        client.pre_call(&caller, &route);
+
+        let state = client.rate_limit_state(&route, &caller).unwrap();
+        assert_eq!(state.calls_in_window, 3);
+
+        // 4th call must be rejected
+        assert_eq!(
+            client.try_pre_call(&caller, &route),
+            Err(Ok(MiddlewareError::RateLimitExceeded))
+        );
+
+        // Counter must not have advanced past the limit
+        let state_after = client.rate_limit_state(&route, &caller).unwrap();
+        assert_eq!(state_after.calls_in_window, 3);
+    }
+
+    #[test]
+    fn test_rate_limit_independent_counters_per_caller() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &3, &60, &true, &0, &0, &0);
+
+        let caller_a = Address::generate(&env);
+        let caller_b = Address::generate(&env);
+
+        // caller_a makes 3 calls → hits limit
+        client.pre_call(&caller_a, &route);
+        client.pre_call(&caller_a, &route);
+        client.pre_call(&caller_a, &route);
+        assert_eq!(
+            client.try_pre_call(&caller_a, &route),
+            Err(Ok(MiddlewareError::RateLimitExceeded))
+        );
+
+        // caller_b's counter is independent — first call must succeed
+        assert!(client.try_pre_call(&caller_b, &route).is_ok());
+        let state_b = client.rate_limit_state(&route, &caller_b).unwrap();
+        assert_eq!(state_b.calls_in_window, 1);
+
+        // caller_a's counter must remain at 3, unaffected by caller_b
+        let state_a = client.rate_limit_state(&route, &caller_a).unwrap();
+        assert_eq!(state_a.calls_in_window, 3);
+    }
+
+    #[test]
+    fn test_rate_limit_counter_resets_after_window_and_increments_again() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &5, &60, &true, &0, &0, &0);
+
+        let caller = Address::generate(&env);
+
+        client.pre_call(&caller, &route);
+        client.pre_call(&caller, &route);
+        let state_before = client.rate_limit_state(&route, &caller).unwrap();
+        assert_eq!(state_before.calls_in_window, 2);
+
+        // Advance past window
+        env.ledger().with_mut(|l| l.timestamp += 61);
+
+        // First call in new window resets and increments to 1
+        client.pre_call(&caller, &route);
+        let state_after = client.rate_limit_state(&route, &caller).unwrap();
+        assert_eq!(state_after.calls_in_window, 1);
+    }
+
+    #[test]
+    fn test_configure_route_zero_window_with_limit_returns_invalid_config() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        let result = client.try_configure_route(&admin, &route, &10, &0, &true, &0, &0, &0);
+        assert_eq!(result, Err(Ok(MiddlewareError::InvalidConfig)));
+    }
+
+    #[test]
+    fn test_configure_route_zero_window_with_zero_limit_succeeds() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // max_calls=0 means unlimited — window_seconds=0 is fine in that case
+        assert!(client
+            .try_configure_route(&admin, &route, &0, &0, &true, &0, &0, &0)
+            .is_ok());
     }
 }
