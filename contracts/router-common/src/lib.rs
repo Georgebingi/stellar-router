@@ -178,6 +178,9 @@ pub const EVENT_OP_CANCELLED: &str = "op_cancelled";
 /// Standard event topic for timelock operation description updates
 pub const EVENT_OP_DESCRIPTION_UPDATED: &str = "op_description_updated";
 
+/// Standard event topic for timelock minimum delay updates
+pub const EVENT_MIN_DELAY_UPDATED: &str = "min_delay_updated";
+
 /// Standard event topic for contract registration in registry
 pub const EVENT_CONTRACT_REGISTERED: &str = "contract_registered";
 
