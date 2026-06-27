@@ -7,16 +7,30 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::{
-    state::AppState,
+    state::{AppState, MAX_SUBSCRIPTIONS_PER_CONNECTION},
     types::{SubscribeMessage, TransactionStatusEvent},
 };
 
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
 /// WebSocket upgrade handler
 pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    if !state.try_acquire_ws_connection() {
+        return ws
+            .on_upgrade(|mut socket| async move {
+                let msg = json!({"error": "connection limit reached"}).to_string();
+                let _ = socket.send(Message::Text(msg)).await;
+                let _ = socket.close().await;
+            })
+            .into_response();
+    }
     ws.on_upgrade(|socket| handle_socket(socket, state))
+        .into_response()
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
@@ -29,32 +43,51 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         String,
         tokio::sync::broadcast::Receiver<TransactionStatusEvent>,
     )> = Vec::new();
+    let mut last_activity = tokio::time::Instant::now();
+    let mut ping_ticker = tokio::time::interval(PING_INTERVAL);
+    ping_ticker.tick().await; // consume the immediate first tick
 
     loop {
         tokio::select! {
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        last_activity = tokio::time::Instant::now();
                         match serde_json::from_str::<SubscribeMessage>(&text) {
                             Ok(sub_msg) => {
                                 if sub_msg.action == "subscribe" {
-                                    info!("Client subscribed to tx_id: {}", sub_msg.tx_id);
-                                    subscriptions.push(sub_msg.tx_id.clone());
-                                    state.add_subscriber(sub_msg.tx_id.clone());
-                                    let rx = state.tx_status_tx.subscribe();
-                                    rx_handles.push((sub_msg.tx_id.clone(), rx));
+                                    if subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                                        warn!(
+                                            "Client hit subscription limit of {}",
+                                            MAX_SUBSCRIPTIONS_PER_CONNECTION
+                                        );
+                                        let response = json!({
+                                            "msg_type": "error",
+                                            "data": {"message": "subscription limit reached"},
+                                        });
+                                        if let Err(e) = sender.send(Message::Text(response.to_string())).await {
+                                            error!("Failed to send error: {}", e);
+                                            break;
+                                        }
+                                    } else {
+                                        info!("Client subscribed to tx_id: {}", sub_msg.tx_id);
+                                        subscriptions.push(sub_msg.tx_id.clone());
+                                        state.add_subscriber(sub_msg.tx_id.clone());
+                                        let rx = state.tx_status_tx.subscribe();
+                                        rx_handles.push((sub_msg.tx_id.clone(), rx));
 
-                                    let response = json!({
-                                        "msg_type": "subscribed",
-                                        "data": {
-                                            "tx_id": sub_msg.tx_id,
-                                            "status": "subscribed",
-                                        },
-                                    });
+                                        let response = json!({
+                                            "msg_type": "subscribed",
+                                            "data": {
+                                                "tx_id": sub_msg.tx_id,
+                                                "status": "subscribed",
+                                            },
+                                        });
 
-                                    if let Err(e) = sender.send(Message::Text(response.to_string())).await {
-                                        error!("Failed to send subscription confirmation: {}", e);
-                                        break;
+                                        if let Err(e) = sender.send(Message::Text(response.to_string())).await {
+                                            error!("Failed to send subscription confirmation: {}", e);
+                                            break;
+                                        }
                                     }
                                 } else if sub_msg.action == "unsubscribe" {
                                     info!("Client unsubscribed from tx_id: {}", sub_msg.tx_id);
@@ -67,6 +100,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 warn!("Failed to parse WebSocket message: {}", e);
                             }
                         }
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        last_activity = tokio::time::Instant::now();
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         info!("WebSocket client disconnected");
@@ -111,6 +147,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
             }
+            _ = ping_ticker.tick() => {
+                if last_activity.elapsed() >= IDLE_TIMEOUT {
+                    info!("WebSocket client timed out due to inactivity");
+                    break;
+                }
+                if let Err(e) = sender.send(Message::Ping(vec![])).await {
+                    error!("Failed to send ping: {}", e);
+                    break;
+                }
+            }
         }
     }
 
@@ -119,6 +165,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     for tx_id in &subscriptions {
         state.remove_subscriber(tx_id);
     }
+    state.release_ws_connection();
 
     info!("WebSocket handler exiting");
 }
