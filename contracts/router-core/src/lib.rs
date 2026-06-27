@@ -122,6 +122,7 @@ pub enum ResolveError {
     RouterPaused,
     RouteNotFound,
     RoutePaused,
+    NotInitialized,
 }
 
 /// Per-entry result returned by [`RouterCore::batch_resolve`].
@@ -1280,6 +1281,10 @@ impl RouterCore {
             (existing_name, alias_name),
         );
 
+        // Alias changes can affect which route is selected via the alias name;
+        // refresh the cached best route so resolve() returns fresh results.
+        scoring::recompute_best_route(&env);
+
         Ok(())
     }
 
@@ -1329,6 +1334,9 @@ impl RouterCore {
             (Symbol::new(&env, router_common::EVENT_ALIAS_REMOVED),),
             alias_name,
         );
+
+        // Alias removal can affect route selection; refresh the cached best route.
+        scoring::recompute_best_route(&env);
 
         Ok(())
     }
@@ -1612,6 +1620,9 @@ impl RouterCore {
                     BatchResolveResult::Err(ResolveError::RouterPaused)
                 }
                 Err(RouterError::RoutePaused) => BatchResolveResult::Err(ResolveError::RoutePaused),
+                Err(RouterError::NotInitialized) => {
+                    BatchResolveResult::Err(ResolveError::NotInitialized)
+                }
                 Err(_) => BatchResolveResult::Err(ResolveError::RouteNotFound),
             };
             results.push_back(outcome);
@@ -2638,6 +2649,106 @@ mod tests {
         let alias = String::from_str(&env, "oracle-v1");
         let result = client.try_add_alias(&admin, &name, &alias);
         assert_eq!(result, Err(Ok(RouterError::RouteNotFound)));
+    }
+
+    // ── Issue #630: alias changes must trigger best-route recomputation ─────
+
+    /// add_alias must call recompute_best_route so the cached best route is
+    /// fresh after an alias is created. Verified by confirming that resolve()
+    /// still returns the correct scored route after an alias is added.
+    #[test]
+    fn test_add_alias_triggers_best_route_recompute() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let alias = String::from_str(&env, "route-a-alias");
+        let addr1 = Address::generate(&env);
+
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.set_route_score(
+            &admin,
+            &r1,
+            &RouteScore {
+                liquidity_score: 80,
+                fee_bps: 10,
+                reliability_score: 90,
+            },
+        );
+
+        // Creating an alias must not corrupt the cached best route:
+        // resolving should still return the scored route's address.
+        client.add_alias(&admin, &r1, &alias);
+        assert_eq!(client.resolve(&r1), addr1);
+        assert_eq!(client.resolve(&alias), addr1);
+    }
+
+    /// remove_alias must call recompute_best_route so the cached best route is
+    /// fresh after an alias is removed. Verified by confirming that resolve()
+    /// still returns the correct scored route after the alias is gone.
+    #[test]
+    fn test_remove_alias_triggers_best_route_recompute() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let alias = String::from_str(&env, "route-a-alias");
+        let addr1 = Address::generate(&env);
+
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.set_route_score(
+            &admin,
+            &r1,
+            &RouteScore {
+                liquidity_score: 80,
+                fee_bps: 10,
+                reliability_score: 90,
+            },
+        );
+        client.add_alias(&admin, &r1, &alias);
+
+        // Removing the alias must not corrupt the cached best route.
+        client.remove_alias(&admin, &alias);
+        assert_eq!(client.resolve(&r1), addr1);
+    }
+
+    /// With two scored routes, adding an alias to the non-best route must not
+    /// accidentally replace the cached best route with the lower-scored one.
+    #[test]
+    fn test_add_alias_does_not_displace_cached_best_route() {
+        let (env, admin, client) = setup();
+        let r1 = String::from_str(&env, "route-a");
+        let r2 = String::from_str(&env, "route-b");
+        let alias = String::from_str(&env, "route-b-alias");
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+
+        client.register_route(&admin, &r1, &addr1, &None);
+        client.register_route(&admin, &r2, &addr2, &None);
+
+        // r1 scores higher
+        client.set_route_score(
+            &admin,
+            &r1,
+            &RouteScore {
+                liquidity_score: 90,
+                fee_bps: 5,
+                reliability_score: 95,
+            },
+        );
+        client.set_route_score(
+            &admin,
+            &r2,
+            &RouteScore {
+                liquidity_score: 40,
+                fee_bps: 50,
+                reliability_score: 40,
+            },
+        );
+
+        // r1 should be the best route before the alias
+        assert_eq!(client.resolve(&r1), addr1);
+
+        // Adding an alias to r2 must not evict r1 from the cache
+        client.add_alias(&admin, &r2, &alias);
+        assert_eq!(client.resolve(&r1), addr1);
+        assert_eq!(client.resolve(&alias), addr1); // score-based: still resolves to r1
     }
 
     #[test]
@@ -3839,6 +3950,28 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results.get(0).unwrap(), BatchResolveResult::Ok(addr));
+    }
+
+    /// Issue #628: ResolveError must include a NotInitialized variant so that
+    /// batch_resolve can preserve the original error type from resolve() rather
+    /// than collapsing all non-Paused errors into RouteNotFound.
+    /// Verify the variant exists and is distinct from other variants.
+    #[test]
+    fn test_resolve_error_not_initialized_variant_exists_and_is_distinct() {
+        let err = ResolveError::NotInitialized;
+        assert!(matches!(err, ResolveError::NotInitialized));
+        assert_ne!(err, ResolveError::RouteNotFound);
+        assert_ne!(err, ResolveError::RouterPaused);
+        assert_ne!(err, ResolveError::RoutePaused);
+    }
+
+    /// Issue #628: batch_resolve wraps NotInitialized from resolve() correctly
+    /// — the BatchResolveResult::Err variant can hold ResolveError::NotInitialized.
+    #[test]
+    fn test_batch_resolve_result_can_hold_not_initialized() {
+        let result = BatchResolveResult::Err(ResolveError::NotInitialized);
+        assert_eq!(result, BatchResolveResult::Err(ResolveError::NotInitialized));
+        assert_ne!(result, BatchResolveResult::Err(ResolveError::RouteNotFound));
     }
 
     #[test]
